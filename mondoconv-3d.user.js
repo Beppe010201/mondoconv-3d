@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mondo Convenienza → modello 3D (GLB)
 // @namespace    https://github.com/mondoconv-3d
-// @version      0.3.0
+// @version      0.4.0
 // @description  Aggiunge un pulsante alle pagine prodotto di mondoconv.it che genera un modello 3D parametrico (.glb) a partire da misure, struttura e colori della scheda prodotto.
 // @match        https://www.mondoconv.it/*
 // @match        https://mondoconv.it/*
@@ -9,6 +9,8 @@
 // @require      https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js#sha256=b4c6e53f98538535b11fd6655627d47fb5877b3ad972568bff0a7026c4b6d5c4
 // @require      https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/exporters/GLTFExporter.js#sha256=7ba9cf5888ff8c11768ff805d50081c383a91ae4dbf487750065bbbeccd45077
 // @require      https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/environments/RoomEnvironment.js#sha256=251b4e779abb5b432f99a326878fe239747c1fe55f390933085fc3deb20d2cea
+// @require      https://cdn.jsdelivr.net/npm/pdfjs-dist@2.16.105/build/pdf.min.js#sha256=1fc294eefda602e591a06c1d5af361cae23756b5a334fc2421d5f9accce038e5
+// @require      https://cdn.jsdelivr.net/npm/pdfjs-dist@2.16.105/build/pdf.worker.min.js#sha256=99732130603cd4980f009a29a38a86373b43ffb9ae22c35ec85440f311ceddfc
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_getValue
@@ -31,10 +33,435 @@
  * I tipi non ancora gestiti producono un volume "segnaposto" con misure e colore.
  */
 
+// ===== Analisi schede tecniche =====
+/* Analisi delle schede tecniche (PDF) di Mondo Convenienza.
+ * Indipendente dal formato: lavora sull'immagine renderizzata della pagina.
+ *  1. rende ogni pagina su canvas (pdf.js)
+ *  2. separa i disegni (componenti connesse dell'"inchiostro", escluse le quote rosse)
+ *  3. per ogni disegno ricava la sagoma piena (riempimento dall'esterno + apertura morfologica
+ *     per togliere linee di quota e richiami sottili)
+ *  4. scarta assonometrie/istruzioni (poche linee orizzontali/verticali) e riquadri pieni
+ *  5. riconosce fronte / fianco / pianta confrontando le proporzioni con l'ingombro noto L×P×H
+ * Nessuna regola legata al singolo documento: le misure vengono dalla scala del disegno.
+ */
+const MC3D_Sheet = (() => {
+  'use strict';
+
+  const RENDER_W = 1100;          // larghezza di rendering pagina (px)
+  const INK_LUM = 200;            // soglia luminanza per "inchiostro"
+  const MAX_PAGES = 8;
+
+  // ---------- utilità immagine binaria (Uint8Array 0/1, larghezza w, altezza h) ----------
+  function integral(m, w, h) {
+    const I = new Int32Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let row = 0;
+      for (let x = 0; x < w; x++) {
+        row += m[y * w + x];
+        I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row;
+      }
+    }
+    return I;
+  }
+  function boxSum(I, w, x0, y0, x1, y1) { // [x0,x1) [y0,y1)
+    const W = w + 1;
+    return I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0];
+  }
+  function dilate(m, w, h, r) {
+    if (r <= 0) return m.slice();
+    const I = integral(m, w, h), o = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+        o[y * w + x] = boxSum(I, w, x0, y0, x1, y1) > 0 ? 1 : 0;
+      }
+    }
+    return o;
+  }
+  function erode(m, w, h, r) {
+    if (r <= 0) return m.slice();
+    const I = integral(m, w, h), o = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = y - r, y1 = y + r + 1;
+      for (let x = 0; x < w; x++) {
+        const x0 = x - r, x1 = x + r + 1;
+        if (x0 < 0 || y0 < 0 || x1 > w || y1 > h) { o[y * w + x] = 0; continue; }
+        o[y * w + x] = boxSum(I, w, x0, y0, x1, y1) === (2 * r + 1) * (2 * r + 1) ? 1 : 0;
+      }
+    }
+    return o;
+  }
+  /** Componenti connesse (4-vicinato). Restituisce {labels, comps:[{id,x0,y0,x1,y1,n}]} */
+  function components(m, w, h, minN) {
+    const lab = new Int32Array(w * h), comps = [];
+    const stack = new Int32Array(w * h);
+    let id = 0;
+    for (let i = 0; i < w * h; i++) {
+      if (!m[i] || lab[i]) continue;
+      id++;
+      let sp = 0, n = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+      stack[sp++] = i; lab[i] = id;
+      while (sp) {
+        const p = stack[--sp], x = p % w, y = (p / w) | 0;
+        n++;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (x > 0 && m[p - 1] && !lab[p - 1]) { lab[p - 1] = id; stack[sp++] = p - 1; }
+        if (x < w - 1 && m[p + 1] && !lab[p + 1]) { lab[p + 1] = id; stack[sp++] = p + 1; }
+        if (y > 0 && m[p - w] && !lab[p - w]) { lab[p - w] = id; stack[sp++] = p - w; }
+        if (y < h - 1 && m[p + w] && !lab[p + w]) { lab[p + w] = id; stack[sp++] = p + w; }
+      }
+      if (n >= (minN || 1)) comps.push({ id, x0, y0, x1: x1 + 1, y1: y1 + 1, n });
+    }
+    return { labels: lab, comps };
+  }
+  /** Riempie dall'esterno: restituisce la maschera "dentro" (1 = non raggiungibile dal bordo). */
+  function fillInside(m, w, h) {
+    const out = new Uint8Array(w * h), stack = new Int32Array(w * h);
+    let sp = 0;
+    const push = p => { if (!m[p] && !out[p]) { out[p] = 1; stack[sp++] = p; } };
+    for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0;
+      if (x > 0) push(p - 1); if (x < w - 1) push(p + 1);
+      if (y > 0) push(p - w); if (y < h - 1) push(p + w);
+    }
+    const ins = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) ins[i] = out[i] ? 0 : 1;
+    return ins;
+  }
+  function crop(m, w, x0, y0, x1, y1) {
+    const cw = x1 - x0, ch = y1 - y0, o = new Uint8Array(cw * ch);
+    for (let y = 0; y < ch; y++) o.set(m.subarray((y0 + y) * w + x0, (y0 + y) * w + x1), y * cw);
+    return o;
+  }
+  function bboxOf(m, w, h) {
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y * w + x]) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    return x1 < 0 ? null : { x0, y0, x1: x1 + 1, y1: y1 + 1 };
+  }
+  /** Quota di inchiostro su tratti orizzontali/verticali lunghi (assonometrie → valore basso). */
+  function rectilinearity(ink, w, h, L) {
+    let tot = 0, hv = 0;
+    const mark = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let run = 0;
+      for (let x = 0; x <= w; x++) {
+        const v = x < w ? ink[y * w + x] : 0;
+        if (v) run++;
+        else { if (run >= L) for (let k = x - run; k < x; k++) mark[y * w + k] = 1; run = 0; }
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      let run = 0;
+      for (let y = 0; y <= h; y++) {
+        const v = y < h ? ink[y * w + x] : 0;
+        if (v) run++;
+        else { if (run >= L) for (let k = y - run; k < y; k++) mark[k * w + x] = 1; run = 0; }
+      }
+    }
+    for (let i = 0; i < w * h; i++) if (ink[i]) { tot++; if (mark[i]) hv++; }
+    return tot ? hv / tot : 0;
+  }
+
+  // ---------- rendering ----------
+  async function openDoc(pdfjsLib, data) {
+    return pdfjsLib.getDocument({ data, disableFontFace: true, isEvalSupported: false }).promise;
+  }
+  async function renderPage(doc, i) {
+    const page = await doc.getPage(i);
+    const vp0 = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: RENDER_W / vp0.width });
+    const cv = document.createElement('canvas');
+    cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    try { page.cleanup(); } catch (e) { /* ignore */ }
+    return cv;
+  }
+  async function renderPages(pdfjsLib, data) {
+    const doc = await openDoc(pdfjsLib, data);
+    const pages = [];
+    for (let i = 1; i <= Math.min(doc.numPages, MAX_PAGES); i++) pages.push({ index: i, canvas: await renderPage(doc, i) });
+    try { doc.destroy(); } catch (e) { /* ignore */ }
+    return pages;
+  }
+
+  // ---------- analisi di una pagina ----------
+  function analyzePage(canvas, pageIndex) {
+    const w = canvas.width, h = canvas.height;
+    const d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    const ink = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+      const r = d[p], g = d[p + 1], b = d[p + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const red = r > 140 && g < 120 && b < 120 && r - g > 60;   // quote rosse
+      ink[i] = lum < INK_LUM && !red ? 1 : 0;
+    }
+    // unisce tratti vicini dello stesso disegno
+    const joined = dilate(ink, w, h, 2);
+    const { comps } = components(joined, w, h, 30);
+    const pageArea = w * h;
+    const cands = [];
+    for (const c of comps) {
+      const bw = c.x1 - c.x0, bh = c.y1 - c.y0;
+      if (bw * bh < pageArea * 0.004) continue;               // troppo piccolo (testo, simboli)
+      const touches = c.x0 <= 3 || c.y0 <= 3 || c.x1 >= w - 3 || c.y1 >= h - 3;
+      const m = 2;
+      const X0 = Math.max(0, c.x0 - m), Y0 = Math.max(0, c.y0 - m), X1 = Math.min(w, c.x1 + m), Y1 = Math.min(h, c.y1 + m);
+      const cw = X1 - X0, ch = Y1 - Y0;
+      const inkC = crop(ink, w, X0, Y0, X1, Y1);
+      const joinC = crop(joined, w, X0, Y0, X1, Y1);
+      let inkN = 0; for (let i = 0; i < inkC.length; i++) inkN += inkC[i];
+      const density = inkN / (bw * bh);
+      // sagoma: chiusura leggera dei tratti, riempimento dall'esterno, apertura per togliere linee sottili
+      const closed = dilate(inkC, cw, ch, 2);
+      const inside = fillInside(closed, cw, ch);
+      const r = Math.max(3, Math.round(Math.min(cw, ch) * 0.012));
+      const opened = dilate(erode(inside, cw, ch, r), cw, ch, r);
+      const cc = components(opened, cw, ch, 1);
+      if (!cc.comps.length) continue;
+      // tiene le parti principali della sagoma (>= 3% della maggiore): gambe separate restano incluse
+      cc.comps.sort((a, b) => b.n - a.n);
+      const keepIds = new Set(cc.comps.filter(k => k.n >= cc.comps[0].n * 0.03).map(k => k.id));
+      const sil = new Uint8Array(cw * ch);
+      for (let i = 0; i < sil.length; i++) sil[i] = keepIds.has(cc.labels[i]) ? 1 : 0;
+      const bb = bboxOf(sil, cw, ch);
+      if (!bb) continue;
+      const sw = bb.x1 - bb.x0, sh = bb.y1 - bb.y0;
+      if (sw < 20 || sh < 20) continue;
+      const silC = crop(sil, cw, bb.x0, bb.y0, bb.x1, bb.y1);
+      const inkS = crop(inkC, cw, bb.x0, bb.y0, bb.x1, bb.y1);
+      let silN = 0; for (let i = 0; i < silC.length; i++) silN += silC[i];
+      const rect = rectilinearity(inkS, sw, sh, Math.max(10, Math.round(Math.min(sw, sh) * 0.04)));
+      cands.push({
+        page: pageIndex,
+        x: X0 + bb.x0, y: Y0 + bb.y0, w: sw, h: sh,        // riquadro della sagoma in px pagina
+        sil: silC, ink: inkS, fill: silN / (sw * sh), density, rect, touches,
+        usable: !touches && density < 0.85 && rect >= 0.6 && sw * sh >= pageArea * 0.025,
+      });
+    }
+    return cands;
+  }
+
+  // ---------- riconoscimento viste ----------
+  function matchViews(cands, W, D, H) {
+    const roles = { front: [W, H], side: [D, H], top: [W, D] };
+    const usable = cands.filter(c => c.usable);
+    const err = (c, [a, b]) => Math.abs(Math.log((c.w / c.h) / (a / b)));
+    const TOL = 0.1;
+    const pick = (role, pref) => {
+      const list = usable.map(c => ({ c, e: err(c, roles[role]) })).filter(o => o.e < TOL);
+      if (!list.length) return null;
+      list.sort((p, q) => (pref ? pref(p.c) - pref(q.c) : 0) || p.e - q.e || q.c.w * q.c.h - p.c.w * p.c.h);
+      return list[0].c;
+    };
+    // fronte: la più grande tra quelle compatibili (a parità di errore)
+    const frontList = usable.map(c => ({ c, e: err(c, roles.front) })).filter(o => o.e < TOL)
+      .sort((p, q) => (q.c.w * q.c.h) - (p.c.w * p.c.h));
+    const front = frontList.length ? frontList[0].c : null;
+    const near = (a, b) => Math.abs(Math.log(a / b));
+    const side = pick('side', front ? c => (c === front ? 9 : 0) + (c.page === front.page ? near(c.h, front.h) : 0.5) : null);
+    const top = pick('top', front ? c => (c === front || c === side ? 9 : 0) + (c.page === front.page ? near(c.w, front.w) : 0.5) : null);
+    const res = { front, side: side !== front ? side : null, top: top !== front && top !== side ? top : null };
+    // con L≈P fronte e fianco possono coincidere: va bene usare la stessa sagoma
+    return res;
+  }
+
+  // ---------- misure dalla sagoma ----------
+  /** Profilo per righe: per ogni riga, segmenti pieni [x0,x1) in px. */
+  function rowRuns(v, y) {
+    const out = []; let s = -1;
+    for (let x = 0; x <= v.w; x++) {
+      const on = x < v.w && v.sil[y * v.w + x];
+      if (on && s < 0) s = x;
+      if (!on && s >= 0) { out.push([s, x]); s = -1; }
+    }
+    return out;
+  }
+  /** Linee interne lunghe (inchiostro) verticali/orizzontali: posizioni in px e frazione di lunghezza. */
+  function longLines(v, dir, minFrac, span) {
+    const res = [];
+    const [a0, a1] = span || [0, dir === 'v' ? v.w : v.h];
+    const len = dir === 'v' ? v.h : v.w;
+    for (let k = a0; k < a1; k++) {
+      let best = 0, run = 0;
+      for (let t = 0; t < len; t++) {
+        const on = dir === 'v' ? v.ink[t * v.w + k] : v.ink[k * v.w + t];
+        if (on) { run++; if (run > best) best = run; } else run = 0;
+      }
+      if (best >= len * minFrac) res.push({ pos: k, frac: best / len });
+    }
+    // raggruppa linee adiacenti (spessori, doppie linee)
+    const groups = [];
+    for (const r of res) {
+      const g = groups[groups.length - 1];
+      if (g && r.pos - g.p1 <= 3) { g.p1 = r.pos; g.frac = Math.max(g.frac, r.frac); }
+      else groups.push({ p0: r.pos, p1: r.pos, frac: r.frac });
+    }
+    return groups;
+  }
+  function linesInSpan(v, dir, minFrac, from, to) {
+    // linee orizzontali (dir 'h') misurate solo tra x=from..to (o verticali tra y)
+    const res = [];
+    const lenSpan = to - from;
+    const n = dir === 'h' ? v.h : v.w;
+    for (let k = 0; k < n; k++) {
+      let best = 0, run = 0;
+      for (let t = from; t < to; t++) {
+        const on = dir === 'h' ? v.ink[k * v.w + t] : v.ink[t * v.w + k];
+        if (on) { run++; if (run > best) best = run; } else run = 0;
+      }
+      if (best >= lenSpan * minFrac) res.push(k);
+    }
+    const groups = [];
+    for (const p of res) {
+      const g = groups[groups.length - 1];
+      if (g && p - g.p1 <= 3) g.p1 = p; else groups.push({ p0: p, p1: p });
+    }
+    return groups;
+  }
+
+  /** Misure generali dal fronte (cm): cornice, base (zoccolo/piedini). */
+  function frontProfile(v, W, H) {
+    const sx = W / v.w, sy = H / v.h;
+    const widths = [], gaps = [];
+    for (let y = 0; y < v.h; y++) {
+      const runs = rowRuns(v, y);
+      widths.push(runs.reduce((s, r) => s + r[1] - r[0], 0));
+      gaps.push(runs.length);
+    }
+    const mid = widths.slice(Math.floor(v.h * 0.3), Math.floor(v.h * 0.7)).sort((a, b) => a - b);
+    const body = mid[Math.floor(mid.length / 2)] || v.w;
+    let top = 0; while (top < v.h * 0.25 && widths[top] > body * 1.01 + 2) top++;
+    let bot = v.h - 1; while (bot > v.h * 0.6 && (widths[bot] < body * 0.97 - 2 || gaps[bot] > 1)) bot--;
+    const baseRows = v.h - 1 - bot;
+    const feet = baseRows > 0 && gaps.slice(bot + 1).filter(g => g > 1).length > baseRows * 0.5;
+    return {
+      bodyW: body * sx,
+      corniceH: top * sy,
+      corniceOver: top ? (v.w - body) / 2 * sx : 0,
+      baseH: baseRows * sy,
+      feet,
+    };
+  }
+
+  /** Armadio a ponte dal fronte: larghezza colonne e altezza del ponte (cm). */
+  function bridgeFromFront(v, W, H) {
+    const sx = W / v.w, sy = H / v.h;
+    const vl = longLines(v, 'v', 0.9);
+    // escludi i bordi esterni
+    const inner = vl.filter(g => g.p0 > v.w * 0.04 && g.p1 < v.w * 0.96);
+    const leftG = inner.filter(g => g.p1 < v.w * 0.45);
+    const rightG = inner.filter(g => g.p0 > v.w * 0.55);
+    if (!leftG.length || !rightG.length) return null;
+    const xL = leftG[leftG.length - 1].p1 + 1, xR = rightG[0].p0;
+    const hl = linesInSpan(v, 'h', 0.8, xL, xR).filter(g => g.p0 > v.h * 0.06 && g.p1 < v.h * 0.85);
+    if (!hl.length) return null;
+    const yB = hl[0].p1 + 1;
+    return { colL: xL * sx, colR: (v.w - xR) * sx, bridgeH: yB * sy };
+  }
+
+  // ---------- solido dalle sagome (visual hull) ----------
+  /** Campiona una sagoma in coordinate normalizzate u,v ∈ [0,1] (v=0 in alto nel disegno). */
+  function sampler(v, flipX) {
+    return (u, t) => {
+      if (!v) return 1;
+      let x = Math.floor((flipX ? 1 - u : u) * v.w), y = Math.floor(t * v.h);
+      if (x < 0) x = 0; if (x >= v.w) x = v.w - 1; if (y < 0) y = 0; if (y >= v.h) y = v.h - 1;
+      return v.sil[y * v.w + x];
+    };
+  }
+  /** Lato "alto" del fianco: la metà più alta va verso la parete (dietro). */
+  function sideBackIsLeft(v) {
+    if (!v) return true;
+    const colH = x => { let n = 0; for (let y = 0; y < v.h; y++) n += v.sil[y * v.w + x]; return n; };
+    let l = 0, r = 0;
+    for (let x = 0; x < v.w; x++) (x < v.w / 2 ? (l += colH(x)) : (r += colH(x)));
+    return l >= r;
+  }
+
+  /**
+   * Voxel: X (larghezza) da sinistra, Y (altezza) dal basso, Z (profondità) dal retro (0) al fronte (D).
+   * Restituisce {nx,ny,nz,vox,cell} con cell in metri.
+   */
+  function hullVoxels(views, W, D, H, maxCells) {
+    const cell = Math.max(W, D, H) / (maxCells || 140);
+    const nx = Math.max(2, Math.round(W / cell)), ny = Math.max(2, Math.round(H / cell)), nz = Math.max(2, Math.round(D / cell));
+    const F = sampler(views.front, false);
+    const backLeft = sideBackIsLeft(views.side);
+    const S = sampler(views.side, !backLeft);       // u=0 → retro
+    const T = sampler(views.top, false);            // pianta: in alto il retro (convenzione di disegno)
+    const vox = new Uint8Array(nx * ny * nz);
+    for (let z = 0; z < nz; z++) {
+      const uz = (z + 0.5) / nz;
+      for (let y = 0; y < ny; y++) {
+        const ty = 1 - (y + 0.5) / ny;
+        if (!S(uz, ty)) continue;
+        for (let x = 0; x < nx; x++) {
+          const ux = (x + 0.5) / nx;
+          if (F(ux, ty) && T(ux, uz)) vox[(z * ny + y) * nx + x] = 1;
+        }
+      }
+    }
+    return { nx, ny, nz, vox, cell: { x: W / nx, y: H / ny, z: D / nz } };
+  }
+
+  /** Greedy meshing delle facce esposte: restituisce array di posizioni (triangoli) e normali. */
+  function meshVoxels(g) {
+    const { nx, ny, nz, vox } = g;
+    const dims = [nx, ny, nz];
+    const at = (x, y, z) => (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) ? 0 : vox[(z * ny + y) * nx + x];
+    const pos = [], nor = [];
+    for (let d = 0; d < 3; d++) {
+      const u = (d + 1) % 3, v = (d + 2) % 3;
+      const q = [0, 0, 0]; q[d] = 1;
+      const mask = new Int8Array(dims[u] * dims[v]);
+      const x = [0, 0, 0];
+      for (x[d] = -1; x[d] < dims[d];) {
+        let n = 0;
+        for (x[v] = 0; x[v] < dims[v]; x[v]++) for (x[u] = 0; x[u] < dims[u]; x[u]++) {
+          const a = at(x[0], x[1], x[2]), b = at(x[0] + q[0], x[1] + q[1], x[2] + q[2]);
+          mask[n++] = a === b ? 0 : a ? 1 : -1;
+        }
+        x[d]++;
+        n = 0;
+        for (let j = 0; j < dims[v]; j++) for (let i = 0; i < dims[u];) {
+          const c = mask[n];
+          if (!c) { i++; n++; continue; }
+          let wdt = 1; while (i + wdt < dims[u] && mask[n + wdt] === c) wdt++;
+          let hgt = 1, done = false;
+          for (; j + hgt < dims[v]; hgt++) {
+            for (let k = 0; k < wdt; k++) if (mask[n + k + hgt * dims[u]] !== c) { done = true; break; }
+            if (done) break;
+          }
+          const b = [0, 0, 0]; b[d] = x[d]; b[u] = i; b[v] = j;
+          const du = [0, 0, 0]; du[u] = wdt;
+          const dv = [0, 0, 0]; dv[v] = hgt;
+          const p0 = b, p1 = [b[0] + du[0], b[1] + du[1], b[2] + du[2]], p2 = [b[0] + du[0] + dv[0], b[1] + du[1] + dv[1], b[2] + du[2] + dv[2]], p3 = [b[0] + dv[0], b[1] + dv[1], b[2] + dv[2]];
+          const nn = [0, 0, 0]; nn[d] = c;
+          const tri = c > 0 ? [p0, p1, p2, p0, p2, p3] : [p0, p2, p1, p0, p3, p2];
+          for (const p of tri) { pos.push(p[0], p[1], p[2]); nor.push(nn[0], nn[1], nn[2]); }
+          for (let l = 0; l < hgt; l++) for (let k = 0; k < wdt; k++) mask[n + k + l * dims[u]] = 0;
+          i += wdt; n += wdt;
+        }
+      }
+    }
+    return { pos, nor };
+  }
+
+  return { MAX_PAGES, openDoc, renderPage, renderPages, analyzePage, matchViews, frontProfile, bridgeFromFront, hullVoxels, meshVoxels, sideBackIsLeft };
+})();
+
+// ===== Script principale =====
 (function () {
   'use strict';
 
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
   const PRODUCT_PATH_RE = /^\/[a-z0-9-]+-([a-z0-9]{4})\.html$/i;
   const LOG = [];
   const log = (...a) => {
@@ -181,6 +608,16 @@
     ['tavolo', /\bTAVOL[OI]\b/],
   ];
 
+  // Altre famiglie: [categoria, famiglia, regex]. Verificate per prime.
+  const OTHER_TYPES = [
+    ['divano', 'sofa', /\bDIVAN|\bPOLTRON|\bCHAISE LONGUE\b|\bSOFA\b/],
+    ['letto', 'bed', /\bLETT[OI]\b|\bTESTIER|\bGIROLETTO\b/],
+    ['rete', 'rete', /\bRETE\b|\bRETI\b/],
+    ['materasso', 'box', /\bMATERASS|\bTOPPER\b|\bPOUF\b/],
+    ['cucina', 'kitchen', /\bCUCINA\b|\bCUCINE\b/],
+    ['sedia', 'chair', /\bSEDI[AE]\b|\bSGABELL/],
+  ];
+
   function interpret(info) {
     const head = (info.head || '').toUpperCase();
     const spec = {
@@ -188,7 +625,16 @@
       notes: [], category: null, collection: null, label: '',
     };
 
-    for (const [cat, re] of TABLE_TYPES.concat(CABINET_TYPES)) {
+    for (const [cat, fam, re] of OTHER_TYPES) {
+      const m = head.match(re);
+      if (m) {
+        spec.category = cat; spec.family = fam;
+        spec.collection = head.slice(0, m.index).trim() || null;
+        spec.label = head.slice(m.index).trim();
+        break;
+      }
+    }
+    if (!spec.category) for (const [cat, re] of TABLE_TYPES.concat(CABINET_TYPES)) {
       const m = head.match(re);
       if (m) {
         spec.category = cat;
@@ -250,6 +696,24 @@
     }
     spec.colorNames = colorStr.split(/\s*[\/,]\s*/).map(s => s.trim()).filter(Boolean);
 
+    // --- divani
+    if (spec.family === 'sofa') {
+      const ps = head.match(/(\d)\s*POSTI/);
+      spec.seats = ps ? +ps[1] : /POLTRON/.test(head) ? 1 : null;
+      if (/DOPPIO ANGOLO/.test(head)) spec.chaise = 'both';
+      else if (/PENISOLA|ANGOLAR|CHAISE|POUF CONTENITORE/.test(head)) {
+        spec.chaise = /SINISTR/.test(head) ? 'L' : 'R';
+        if (/REVERSIBIL/.test(head)) spec.chaiseNote = 'Penisola reversibile: generata a destra (guardando il divano).';
+        else if (!/DESTR|SINISTR/.test(head)) spec.chaiseNote = 'Lato della penisola non indicato: generata a destra.';
+      } else spec.chaise = 'none';
+    }
+    // --- letti
+    if (spec.family === 'bed') {
+      spec.storage = /CONTENITOR/.test(head);
+      spec.feet = /PIEDIN/.test(head) || (spec.feet && !/SENZA PIEDINI/.test(head));
+    }
+    if (spec.family === 'chair') spec.stool = /SGABELL/.test(head);
+
     // --- tavoli: allungabile, forma, vetro
     if (spec.family === 'table') {
       spec.extendable = /RADDOPPIABIL|ALLUNGABIL|ESTENSIBIL|ALLUNGA\b|\bA LIBRO\b/.test(head);
@@ -268,7 +732,7 @@
     if (!(spec.W > 0.05 && spec.D > 0.05 && spec.H > 0.05) || spec.W > 8 || spec.D > 8 || spec.H > 4) {
       spec.invalid = true;
     }
-    if (spec.category === 'cabina' || /ANGOLAR/.test(head)) spec.notes.push('Forma angolare semplificata: generato come mobile rettangolare con le stesse misure di ingombro.');
+    if (spec.family === 'cabinet' && (spec.category === 'cabina' || /ANGOLAR/.test(head))) spec.notes.push('Forma angolare semplificata: generato come mobile rettangolare con le stesse misure di ingombro.');
     if (/\bPONTE\b/.test(head) && spec.family === 'cabinet') {
       spec.bridge = true;
       // composizione ante: "(1+4+1)"; se assente si stima 1 anta per colonna
@@ -522,7 +986,7 @@
     const a = finishes[0];
     const b = finishes[1] || finishes[0];
     const [body, front] = opts.swap ? [b, a] : [a, b];
-    const roles = spec.family === 'table' ? ['Piano_', 'Gambe_'] : ['Struttura_', 'Frontali_'];
+    const roles = spec.family === 'table' ? ['Piano_', 'Gambe_'] : spec.family === 'sofa' ? ['Struttura_', 'Cuscini_'] : ['Struttura_', 'Frontali_'];
     const mats = {
       body: makeMaterial(body, roles[0] + body.name, opts),
       front: makeMaterial(front, roles[1] + front.name, opts),
@@ -584,7 +1048,7 @@
 
     // zoccolo o piedini
     const wall = spec.category === 'pensile';
-    const base = wall ? 0 : spec.feet ? (tall ? 0.08 : 0.1) : (tall ? 0.07 : 0.05);
+    const base = wall ? 0 : spec.baseOverride != null ? spec.baseOverride : spec.feet ? (tall ? 0.08 : 0.1) : (tall ? 0.07 : 0.05);
     const sidesFromFloor = !wall && !spec.feet;
 
     // fianchi
@@ -812,7 +1276,7 @@
     const W = open && spec.maxW ? spec.maxW : spec.W;
     const D = spec.D, H = spec.H;
     const coffee = spec.category === 'tavolino' || H < 0.6;
-    const topT = spec.glassTop ? 0.012 : (spec.extendable && !open && /RADDOPPIABIL|A LIBRO/.test(spec.label) ? 0.05 : 0.03);
+    const topT = spec.P && spec.P.topT ? spec.P.topT : spec.glassTop ? 0.012 : (spec.extendable && !open && /RADDOPPIABIL|A LIBRO/.test(spec.label) ? 0.05 : 0.03);
     const topMat = spec.glassTop ? mats.glass : mats.body;
     const legMat = spec.glassTop && mats.body === mats.front ? mats.handle : mats.front;
     const yTop = H - topT / 2;
@@ -848,7 +1312,7 @@
       box(g, 'Base', W * 0.6, 0.02, D * 0.5, 0, 0.01, 0, legMat);
     } else {
       // 4 gambe quadrate + fascia sottopiano
-      const ls = coffee ? 0.045 : spec.category === 'consolle' ? 0.04 : 0.06;
+      const ls = spec.P && spec.P.legW ? spec.P.legW : coffee ? 0.045 : spec.category === 'consolle' ? 0.04 : 0.06;
       const inset = 0.03;
       const lx = W / 2 - inset - ls / 2, lz = D / 2 - inset - ls / 2;
       [[-lx, -lz], [lx, -lz], [-lx, lz], [lx, lz]].forEach(([x, z], i) =>
@@ -878,29 +1342,9 @@
     return g;
   }
 
-  /** Parametri del ponte: valori salvati dall'utente per questo prodotto, altrimenti stime. */
-  const BRIDGE_DEFAULTS = { colW: 47, bridgeH: 62 }; // cm: modulo colonna 1 anta tipico MC; altezza pensile stimata
-
-  function bridgeParams(spec, saved) {
-    const W = spec.W * 100, D = spec.D * 100, H = spec.H * 100;
-    const [nl, , nr] = spec.bridgeDoors;
-    const colDef = Math.min(BRIDGE_DEFAULTS.colW, W / 4);
-    const p = {
-      colL: nl ? colDef * nl : 0,
-      colR: nr ? colDef * nr : 0,
-      bridgeH: Math.min(BRIDGE_DEFAULTS.bridgeH, H * 0.4),
-      bridgeD: D,
-      estimated: true,
-    };
-    if (saved) {
-      for (const k of ['colL', 'colR', 'bridgeH', 'bridgeD']) if (saved[k] > 0) p[k] = saved[k];
-      p.estimated = false;
-    }
-    return p;
-  }
-
   /** Armadio a ponte: colonne a terra + pensile sopra il vano letto (misure in cm nei parametri). */
-  function buildBridge(spec, mats, bp) {
+  function buildBridge(spec, mats) {
+    const bp = { colL: spec.P.colL * 100, colR: spec.P.colR * 100, bridgeH: spec.P.bridgeH * 100, bridgeD: spec.P.bridgeD * 100 };
     const g = new THREE.Group();
     const W = spec.W, D = spec.D, H = spec.H;
     const colL = bp.colL / 100, colR = bp.colR / 100, bH = bp.bridgeH / 100, bD = Math.min(bp.bridgeD / 100, D);
@@ -920,6 +1364,210 @@
     return g;
   }
 
+  // ---------------------------------------------------------------------------
+  // PARAMETRI DI FORMA (cm): origine 'scheda' (misurato sul disegno), 'stima', 'utente'
+  // ---------------------------------------------------------------------------
+
+  function defineParams(spec, sheet, saved) {
+    const W = spec.W * 100, D = spec.D * 100, H = spec.H * 100;
+    const list = [];
+    const views = sheet && sheet.views;
+    const add = (k, label, v, src) => list.push({ k, label, v: Math.round(v * 10) / 10, src });
+    if (spec.bridge) {
+      const [nl, , nr] = spec.bridgeDoors;
+      const colDef = Math.min(47, W / 4);
+      const m = sheet && sheet.bridge;
+      add('colL', 'Largh. colonna SX', m ? m.colL : nl ? colDef * nl : 0, m ? 'scheda' : 'stima');
+      add('colR', 'Largh. colonna DX', m ? m.colR : nr ? colDef * nr : 0, m ? 'scheda' : 'stima');
+      add('bridgeH', 'Altezza ponte', m ? m.bridgeH : Math.min(62, H * 0.4), m ? 'scheda' : 'stima');
+      add('bridgeD', 'Profondità ponte', D, 'stima');
+    } else if (spec.family === 'cabinet' && spec.category !== 'pensile') {
+      const pr = sheet && sheet.profile;
+      const tall = H > 130;
+      const baseEst = spec.feet ? (tall ? 8 : 10) : (tall ? 7 : 5);
+      add('baseH', spec.feet ? 'Altezza piedini' : 'Altezza zoccolo', pr && pr.baseH >= 2 ? pr.baseH : baseEst, pr && pr.baseH >= 2 ? 'scheda' : 'stima');
+      add('corniceH', 'Altezza cornice', pr && pr.corniceH >= 1.5 ? pr.corniceH : 0, pr ? 'scheda' : 'stima');
+      add('corniceOver', 'Sporgenza cornice', pr && pr.corniceH >= 1.5 ? pr.corniceOver : 0, pr ? 'scheda' : 'stima');
+    } else if (spec.family === 'table') {
+      const book = spec.extendable && /RADDOPPIABIL|A LIBRO/.test(spec.label);
+      add('topT', 'Spessore piano', spec.glassTop ? 1.2 : book ? 5 : 3, 'stima');
+      add('legW', 'Lato gamba', spec.category === 'tavolino' || H < 60 ? 4.5 : spec.category === 'consolle' ? 4 : 6, 'stima');
+    } else if (spec.family === 'sofa') {
+      const ang = spec.chaise !== 'none';
+      add('seatH', 'Altezza seduta', 45, 'stima');
+      add('armH', 'Altezza braccioli', Math.min(62, H * 0.75), 'stima');
+      add('armW', 'Larghezza bracciolo', spec.noArms ? 0 : 15, 'stima');
+      add('backD', 'Profondità schienale', 22, 'stima');
+      if (ang) {
+        add('mainD', 'Profondità seduta (parte lineare)', Math.min(95, D * 0.62), 'stima');
+        add('chaiseW', 'Larghezza penisola', Math.max(65, Math.min(100, W * 0.38)), 'stima');
+      }
+    } else if (spec.family === 'bed') {
+      add('frameH', 'Altezza giroletto', spec.storage ? 37 : 30, 'stima');
+      add('headT', 'Spessore testiera', 8, 'stima');
+      add('feetH', 'Altezza piedini', spec.feet ? 10 : 0, 'stima');
+    } else if (spec.family === 'kitchen') {
+      add('baseH', 'Altezza basi (con top)', Math.min(90, H), 'stima');
+      add('wallH', 'Altezza pensili', H > 150 ? 72 : 0, 'stima');
+      add('wallD', 'Profondità pensili', 35, 'stima');
+    } else if (spec.family === 'chair') {
+      add('seatH', 'Altezza seduta', Math.min(46, H * 0.55), 'stima');
+      add('legW', 'Lato gamba', 3.5, 'stima');
+    }
+    if (saved) list.forEach(p => { if (saved[p.k] != null && isFinite(saved[p.k])) { p.v = saved[p.k]; p.src = 'utente'; } });
+    const P = {};
+    list.forEach(p => (P[p.k] = p.v / 100));
+    return { list, P };
+  }
+
+  // ---------------------------------------------------------------------------
+  // ALTRI GENERATORI
+  // ---------------------------------------------------------------------------
+
+  /** Mobile con eventuale cornice superiore misurata sul disegno. */
+  function buildCabinetFull(spec, mats) {
+    const P = spec.P || {};
+    const cH = P.corniceH || 0, cO = P.corniceOver || 0;
+    if (P.baseH != null) spec.baseOverride = P.baseH;
+    if (cH < 0.01) return buildCabinet(spec, mats);
+    const g = new THREE.Group();
+    const body = buildCabinet(Object.assign({}, spec, { W: spec.W - 2 * cO, D: spec.D - cO, H: spec.H - cH, notes: spec.notes }), mats);
+    body.position.z = -cO / 2;
+    g.add(body);
+    box(g, 'Cornice', spec.W, cH, spec.D, 0, spec.H - cH / 2, 0, mats.front);
+    return g;
+  }
+
+  /** Divano lineare / angolare / doppio angolo / poltrona. */
+  function buildSofa(spec, mats) {
+    const g = new THREE.Group();
+    const { W, D, H } = spec, P = spec.P;
+    const z0 = -D / 2;
+    const chR = spec.chaise === 'R' || spec.chaise === 'both';
+    const chL = spec.chaise === 'L' || spec.chaise === 'both';
+    const md = spec.chaise !== 'none' ? Math.min(P.mainD, D) : D;
+    const armL = chL ? 0 : P.armW, armR = chR ? 0 : P.armW;
+    const cushT = 0.15, baseTop = Math.max(0.1, P.seatH - cushT);
+    const xs0 = -W / 2 + armL, xs1 = W / 2 - armR, sw = xs1 - xs0;
+    // struttura seduta e schienale
+    box(g, 'Base_seduta', sw, baseTop, md, (xs0 + xs1) / 2, baseTop / 2, z0 + md / 2, mats.body);
+    box(g, 'Schienale_struttura', sw, H * 0.92, P.backD * 0.5, (xs0 + xs1) / 2, H * 0.46, z0 + P.backD * 0.25, mats.body);
+    if (armL > 0) box(g, 'Bracciolo_SX', armL, P.armH, md, -W / 2 + armL / 2, P.armH / 2, z0 + md / 2, mats.body);
+    if (armR > 0) box(g, 'Bracciolo_DX', armR, P.armH, md, W / 2 - armR / 2, P.armH / 2, z0 + md / 2, mats.body);
+    // cuscini
+    const n = Math.max(1, spec.seats || Math.round(sw / 0.65));
+    const cw = sw / n, gap = 0.01;
+    for (let i = 0; i < n; i++) {
+      const cx = xs0 + cw * (i + 0.5);
+      box(g, `Cuscino_seduta_${i + 1}`, cw - gap, cushT, md - P.backD - gap, cx, baseTop + cushT / 2, z0 + P.backD + (md - P.backD) / 2, mats.front);
+      box(g, `Cuscino_schienale_${i + 1}`, cw - gap, H - P.seatH - 0.03, P.backD * 0.5, cx, P.seatH + (H - P.seatH - 0.03) / 2, z0 + P.backD * 0.75, mats.front);
+    }
+    // penisole
+    const chaise = (side) => {
+      const cw2 = Math.min(P.chaiseW, W / (spec.chaise === 'both' ? 2 : 1));
+      const x = side === 'R' ? W / 2 - cw2 / 2 : -W / 2 + cw2 / 2;
+      const dz = D - md;
+      if (dz < 0.05) return;
+      box(g, `Penisola_${side === 'R' ? 'DX' : 'SX'}_base`, cw2, baseTop, dz, x, baseTop / 2, z0 + md + dz / 2, mats.body);
+      box(g, `Penisola_${side === 'R' ? 'DX' : 'SX'}_cuscino`, cw2 - gap, cushT, dz - gap, x, baseTop + cushT / 2, z0 + md + dz / 2, mats.front);
+    };
+    if (chR) chaise('R');
+    if (chL) chaise('L');
+    if (spec.chaiseNote) spec.notes.push(spec.chaiseNote);
+    return g;
+  }
+
+  /** Letto: testiera + giroletto (contenitore pieno) + eventuali piedini. */
+  function buildBed(spec, mats) {
+    const g = new THREE.Group();
+    const { W, D, H } = spec, P = spec.P;
+    const ht = Math.min(P.headT, D * 0.2);
+    box(g, 'Testiera', W, H, ht, 0, H / 2, -D / 2 + ht / 2, mats.body);
+    const fh = Math.max(0.05, P.frameH - P.feetH);
+    const fd = D - ht;
+    box(g, spec.storage ? 'Contenitore' : 'Giroletto', W, fh, fd, 0, P.feetH + fh / 2, -D / 2 + ht + fd / 2, mats.body);
+    if (P.feetH > 0) {
+      const ix = W / 2 - 0.05, z1 = -D / 2 + ht + 0.05, z2 = D / 2 - 0.05;
+      [[-ix, z1], [ix, z1], [-ix, z2], [ix, z2]].forEach(([x, z], i) => cyl(g, 'Piedino_' + (i + 1), 0.02, P.feetH, x, P.feetH / 2, z, mats.feet));
+    }
+    // piano rete (solo visivo, leggermente più chiaro)
+    box(g, 'Piano_rete', W - 0.08, 0.01, fd - 0.06, 0, P.frameH + 0.005, -D / 2 + ht + fd / 2, mats.back);
+    return g;
+  }
+
+  /** Rete a doghe con gambe (senza disegno disponibile). */
+  function buildRete(spec, mats) {
+    const g = new THREE.Group();
+    const { W, D, H } = spec;
+    const ft = 0.05, y = H - ft / 2;
+    box(g, 'Telaio_SX', 0.04, ft, D, -W / 2 + 0.02, y, 0, mats.feet);
+    box(g, 'Telaio_DX', 0.04, ft, D, W / 2 - 0.02, y, 0, mats.feet);
+    box(g, 'Telaio_testa', W, ft, 0.04, 0, y, -D / 2 + 0.02, mats.feet);
+    box(g, 'Telaio_piedi', W, ft, 0.04, 0, y, D / 2 - 0.02, mats.feet);
+    const n = Math.max(6, Math.round(D / 0.12));
+    for (let i = 0; i < n; i++) box(g, 'Doga_' + (i + 1), W - 0.08, 0.012, 0.06, 0, H - 0.01, -D / 2 + 0.08 + (D - 0.16) * i / (n - 1), mats.body);
+    const legs = [[-1, -1], [1, -1], [-1, 1], [1, 1], [-1, 0], [1, 0]];
+    legs.forEach(([sx, sz], i) => box(g, 'Gamba_' + (i + 1), 0.035, H - ft, 0.035, sx * (W / 2 - 0.03), (H - ft) / 2, sz * (D / 2 - 0.03), mats.feet));
+    return g;
+  }
+
+  /** Cucina lineare: basi con top + pensili. */
+  function buildKitchen(spec, mats) {
+    const g = new THREE.Group();
+    const { W, D, H } = spec, P = spec.P;
+    const nMod = Math.max(1, Math.round(W / 0.6));
+    const sub = (w, d, h, doors, cat) => Object.assign({}, spec, {
+      W: w, D: d, H: h, doors, drawers: 0, category: cat, family: 'cabinet', bridge: false, notes: [], feet: false,
+      shelvesTotal: null, rods: null, mirror: 'none', openSection: false, flap: false, sliding: false, longDoors: false, baseOverride: 0.1,
+    });
+    const top = 0.04;
+    const bases = buildCabinet(sub(W, D - 0.02, P.baseH - top, nMod, 'madia'), mats);
+    bases.name = 'Basi'; bases.position.z = -0.01; g.add(bases);
+    box(g, 'Top', W, top, D, 0, P.baseH - top / 2, 0, mats.body);
+    if (P.wallH > 0.05) {
+      const wd = Math.min(P.wallD, D);
+      const wall = buildCabinet(sub(W, wd, P.wallH, nMod, 'pensile'), mats);
+      wall.name = 'Pensili'; wall.position.set(0, H - P.wallH, -D / 2 + wd / 2); g.add(wall);
+    }
+    spec.notes.push('Cucina: moduli da ~60 cm stimati; elettrodomestici non modellati.');
+    return g;
+  }
+
+  /** Sedia / sgabello. */
+  function buildChair(spec, mats) {
+    const g = new THREE.Group();
+    const { W, D, H } = spec, P = spec.P;
+    const lw = P.legW, st = 0.04;
+    box(g, 'Seduta', W, st, D, 0, P.seatH - st / 2, 0, mats.body);
+    const lx = W / 2 - lw / 2, lz = D / 2 - lw / 2;
+    [[-lx, -lz], [lx, -lz], [-lx, lz], [lx, lz]].forEach(([x, z], i) => box(g, 'Gamba_' + (i + 1), lw, P.seatH - st, lw, x, (P.seatH - st) / 2, z, mats.front));
+    if (H - P.seatH > 0.1 && !spec.stool) box(g, 'Schienale', W, H - P.seatH, 0.03, 0, P.seatH + (H - P.seatH) / 2, -D / 2 + 0.015, mats.body);
+    return g;
+  }
+
+  /** Solido ricostruito dalle viste della scheda tecnica. */
+  function buildHull(spec, mats, sheet) {
+    const S = MC3D_Sheet;
+    const vg = S.hullVoxels(sheet.views, spec.W, spec.D, spec.H, 150);
+    const { pos, nor } = S.meshVoxels(vg);
+    const p = new Float32Array(pos.length), n = new Float32Array(nor);
+    for (let i = 0; i < pos.length; i += 3) {
+      p[i] = -spec.W / 2 + pos[i] * vg.cell.x;
+      p[i + 1] = pos[i + 1] * vg.cell.y;
+      p[i + 2] = -spec.D / 2 + pos[i + 2] * vg.cell.z;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(n, 3));
+    const m = new THREE.Mesh(geo, mats.body);
+    m.name = 'Solido_da_scheda';
+    const g = new THREE.Group();
+    g.add(m);
+    const used = ['front', 'side', 'top'].filter(k => sheet.views[k]).map(k => ({ front: 'fronte', side: 'fianco', top: 'pianta' }[k]));
+    spec.notes.push(`Forma ricostruita dalla scheda tecnica (viste: ${used.join(', ')}); dettagli interni e colori secondari non rappresentati.`);
+    return g;
+  }
+
   /** Segnaposto per categorie non ancora gestite: volume d'ingombro con misure e colore reali. */
   function buildPlaceholder(spec, mats) {
     const g = new THREE.Group();
@@ -933,14 +1581,28 @@
     if (spec.invalid) throw new Error('Misure non valide: ' + [info.W, info.D, info.H].join(' × '));
     const finishes = await resolveFinishes(spec, info);
     const mats = buildMaterials(spec, finishes, opts);
+    const sheet = opts.sheet && opts.sheet.status === 'ok' ? opts.sheet : null;
+    if (sheet && spec.family === 'cabinet' && sheet.profile && sheet.profile.feet && sheet.profile.baseH >= 2) spec.feet = true;
+    const pr = defineParams(spec, sheet, opts.saved);
+    spec.params = pr.list; spec.P = pr.P;
+    const nViews = sheet ? ['front', 'side', 'top'].filter(k => sheet.views[k]).length : 0;
+    const hasGen = ['table', 'cabinet', 'sofa', 'bed', 'kitchen', 'chair', 'rete'].includes(spec.family);
     let group, supported = true;
+    spec.method = 'generatore';
     if (spec.family === 'table') group = buildTable(spec, mats, !!opts.open);
-    else if (spec.bridge) { spec.bp = bridgeParams(spec, opts.bridge); group = buildBridge(spec, mats, spec.bp); }
-    else if (spec.category) group = buildCabinet(spec, mats);
+    else if (spec.bridge) group = buildBridge(spec, mats);
+    else if (spec.family === 'kitchen') group = buildKitchen(spec, mats);
+    else if (spec.family === 'cabinet') group = buildCabinetFull(spec, mats);
+    else if (sheet && (hasGen ? sheet.views.front && (sheet.views.side || sheet.views.top) : nViews >= 1)) { group = buildHull(spec, mats, sheet); spec.params = []; spec.method = 'scheda'; }
+    else if (spec.family === 'sofa') group = buildSofa(spec, mats);
+    else if (spec.family === 'bed') group = buildBed(spec, mats);
+    else if (spec.family === 'chair') group = buildChair(spec, mats);
+    else if (spec.family === 'rete') group = buildRete(spec, mats);
+    else if (spec.family === 'box') group = buildPlaceholder(spec, mats);
     else {
       supported = false;
       group = buildPlaceholder(spec, mats);
-      spec.notes.unshift('Categoria non ancora supportata: generato un volume segnaposto con misure e colore corretti.');
+      spec.notes.unshift('Categoria non riconosciuta e nessuna vista utilizzabile nella scheda tecnica: generato un volume con misure e colore corretti.');
     }
     const root = new THREE.Group();
     root.name = fileBase(info, spec) + (opts.open && spec.maxW ? '_aperto' : '');
@@ -1011,6 +1673,15 @@
     .fg label { display: flex; flex-direction: column; font-size: 12px; color: #555; gap: 3px; }
     .fg input { font-size: 16px; padding: 7px 8px; border: 1px solid #bbb; border-radius: 6px; width: 100%; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .note.ok { background: #eaf6ec; border-left: 3px solid #2e7d32; padding: 6px 8px; margin: 6px 0; color: #222; }
+    .src { font-style: normal; font-size: 10px; padding: 1px 5px; border-radius: 8px; margin-left: 2px; }
+    .src.scheda { background: #c8e6c9; color: #1b5e20; } .src.stima { background: #ffe0b2; color: #8a4b00; } .src.utente { background: #bbdefb; color: #0d47a1; }
+    .sheet { margin: 8px 0; padding: 8px; background: #f3f5f8; border-radius: 8px; }
+    .sheet a { display: inline-block; margin-top: 6px; color: #1f5fbf; }
+    .thumbs { display: flex; gap: 8px; overflow-x: auto; margin-top: 6px; flex-wrap: wrap; }
+    .thumbs img { width: 120px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: zoom-in; }
+    .thumbs img.big { width: 100%; cursor: zoom-out; }
+    .hint { font-size: 12px; color: #666; margin-top: 4px; }
     details { margin-top: 8px; }
     pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; background: #f6f6f6; padding: 8px; border-radius: 6px; max-height: 200px; overflow: auto; }
   `;
@@ -1068,13 +1739,16 @@
     ov.addEventListener('click', e => { if (e.target === ov) closePanel(); });
     shadow.appendChild(ov);
     state = { ov, vw, msg, bd, ft, info, swap: false };
-    state.bridge = loadBridge();
+    state.saved = loadParams();
 
     if (!info.source) {
       msg.textContent = 'Non trovo le misure del prodotto in questa pagina. Attendi il caricamento completo (o apri la sezione "Scheda tecnica") e riprova.';
       renderDiagnostics(null);
       return;
     }
+    const st = state;
+    st.sheet = await loadSheet(info, t => { if (state === st) st.msg.textContent = t; });
+    if (state !== st) return;
     await rebuild();
   }
 
@@ -1085,7 +1759,7 @@
     s.msg.textContent = 'Generazione in corso…';
     let res;
     try {
-      res = await buildModel(s.info, { swap: s.swap, open: s.open, bridge: s.bridge });
+      res = await buildModel(s.info, { swap: s.swap, open: s.open, sheet: s.sheet, saved: s.saved });
     } catch (e) {
       log('errore build', String(e && e.stack || e));
       s.msg.textContent = 'Errore nella generazione: ' + (e && e.message || e);
@@ -1105,7 +1779,7 @@
     const rows = [];
     const add = (k, v) => rows.push(el('tr', null, [el('td', { text: k }), typeof v === 'string' ? el('td', { text: v }) : el('td', null, [v])]));
     add('Prodotto', [spec.collection, spec.label].filter(Boolean).join(' – ').toLowerCase() || '—');
-    add('Tipo', spec.category ? spec.category + (res.supported ? '' : '') : 'non supportato (segnaposto)');
+    add('Tipo', spec.category || 'non riconosciuto');
     add('Misure', `L ${s.open && spec.maxW ? Math.round(spec.maxW * 100) + ' (aperto)' : s.info.W} × P ${s.info.D} × H ${s.info.H} cm`);
     if (spec.family === 'table') {
       const d = [];
@@ -1113,7 +1787,7 @@
       if (spec.round) d.push('piano tondo');
       if (spec.glassTop) d.push('piano in vetro');
       if (d.length) add('Dettagli', d.join(', '));
-    } else if (spec.category) {
+    } else if (spec.family === 'cabinet') {
       const fr = [];
       if (spec.doors) fr.push(`${spec.doors} ${spec.doors === 1 ? 'anta' : 'ante'} ${spec.sliding ? 'scorrevoli' : spec.flap ? 'a ribalta' : 'battenti'}`);
       if (spec.drawers) fr.push(`${spec.drawers} cassett${spec.drawers === 1 ? 'o' : 'i'}${spec.longDoors ? ' (interni)' : ''}`);
@@ -1124,16 +1798,17 @@
     const [bodyF, frontF] = s.swap ? [b, a] : [a, b];
     const sw = f => el('span', null, [el('span', { class: 'sw', style: `background:${f.c}` }), f.name + (f.unknown ? (f.sampled ? ' (da foto)' : ' (?)') : '')]);
     const isTable = spec.family === 'table';
-    add(isTable ? 'Piano' : 'Struttura', sw(bodyF));
+    add(isTable ? 'Piano' : spec.family === 'bed' ? 'Rivestimento' : 'Struttura', sw(bodyF));
     const hasFrontPieces = spec.doors > 0 || spec.drawers > 0 || spec.flap;
-    if (isTable ? true : (finishes.length > 1 || hasFrontPieces)) add(isTable ? 'Gambe' : 'Colore frontali', sw(frontF));
-    if (spec.bridge && spec.bp) {
-      const bp = spec.bp;
+    if (isTable ? true : (finishes.length > 1 || hasFrontPieces)) add(isTable ? 'Gambe' : spec.family === 'sofa' ? 'Cuscini' : 'Colore frontali', sw(frontF));
+    if (spec.bridge && spec.bridgeInfo) {
       add('Composizione', `colonna SX ${spec.bridgeDoors[0]} anta · ponte ${spec.bridgeDoors[1]} ante · colonna DX ${spec.bridgeDoors[2]} anta`);
       add('Vano letto', `larghezza ${spec.bridgeInfo.vanoW} cm · luce sotto il ponte ${spec.bridgeInfo.luce} cm`);
     }
+    add('Forma', spec.method === 'scheda' ? 'ricostruita dal disegno della scheda tecnica' : 'generatore parametrico' + (spec.params && spec.params.some(p => p.src === 'scheda') ? ' con misure dalla scheda' : ''));
     s.bd.appendChild(el('table', null, rows));
-    if (spec.bridge && spec.bp) renderBridgeForm(spec);
+    if (spec.params && spec.params.length) renderParamsForm(spec);
+    renderSheetBox(s.sheet);
     s.info.warnings.forEach(w => s.bd.appendChild(el('div', { class: 'warn', text: w })));
     spec.notes.forEach(n => s.bd.appendChild(el('div', { class: 'note', text: '• ' + n })));
 
@@ -1165,37 +1840,154 @@
     s.ft.appendChild(el('button', { class: 'btn', text: 'Chiudi', onclick: closePanel }));
   }
 
-  function bridgeKey() { return 'ponte:' + (state && state.info.code); }
-  function loadBridge() {
-    try { return typeof GM_getValue === 'function' ? GM_getValue(bridgeKey(), null) : null; } catch (e) { return null; }
-  }
-  function saveBridge(v) {
-    try { if (typeof GM_setValue === 'function') GM_setValue(bridgeKey(), v); } catch (e) { log('salvataggio parametri', String(e)); }
+  // ---------------------------------------------------------------------------
+  // SCHEDA TECNICA: download, analisi, miniature
+  // ---------------------------------------------------------------------------
+
+  const sheetCache = {};
+
+  function sheetUrl(code) {
+    const links = [...document.querySelectorAll('a[href]')].map(a => a.href);
+    const hit = links.find(h => /SCHEDA_TECNICA[^/]*\.pdf/i.test(h) && (!code || h.toUpperCase().includes('/' + code + '/') || h.toUpperCase().includes(code + '_')));
+    if (hit) return hit;
+    return code ? `https://media.mondoconv.it/media/catalog/pdf/${code}/${code}_SCHEDA_TECNICA.pdf` : null;
   }
 
-  function renderBridgeForm(spec) {
-    const s = state, bp = spec.bp;
-    const box = el('div', { class: bp.estimated ? 'warn' : 'note' });
-    box.appendChild(el('div', { text: bp.estimated
-      ? 'Misure dei componenti STIMATE. Controlla il disegno nella scheda tecnica del prodotto e correggi qui (cm):'
-      : 'Misure dei componenti inserite da te (salvate per questo prodotto). Puoi modificarle (cm):' }));
-    const fields = [['colL', 'Largh. colonna SX'], ['colR', 'Largh. colonna DX'], ['bridgeH', 'Altezza ponte'], ['bridgeD', 'Profondità ponte']];
+  function fetchArrayBuffer(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('GM_xmlhttpRequest non disponibile'));
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'arraybuffer', timeout: 30000,
+        onload: r => (r.status >= 200 && r.status < 300 ? resolve(r.response) : reject(new Error('HTTP ' + r.status))),
+        onerror: () => reject(new Error('errore rete')),
+        ontimeout: () => reject(new Error('timeout')),
+      });
+    });
+  }
+
+  const tick0 = () => new Promise(r => setTimeout(r, 0));
+
+  async function loadSheet(info, progress) {
+    const key = info.code + ':' + info.W + 'x' + info.D + 'x' + info.H;
+    if (sheetCache[key]) return sheetCache[key];
+    const res = { url: sheetUrl(info.code), status: 'none', views: {}, thumbs: [], cands: [], error: null };
+    if (!res.url) { res.status = 'none'; return res; }
+    if (typeof pdfjsLib === 'undefined' || typeof MC3D_Sheet === 'undefined') { res.status = 'error'; res.error = 'pdf.js non caricato'; return res; }
+    const S = MC3D_Sheet;
+    try {
+      progress('Scarico la scheda tecnica…');
+      const data = new Uint8Array(await fetchArrayBuffer(res.url));
+      if (!(data[0] === 0x25 && data[1] === 0x50 && data[2] === 0x44 && data[3] === 0x46)) throw new Error('la risposta non è un PDF');
+      const doc = await S.openDoc(pdfjsLib, data);
+      const n = Math.min(doc.numPages, S.MAX_PAGES);
+      const canvases = [];
+      for (let i = 1; i <= n; i++) {
+        progress(`Analizzo la scheda tecnica (pagina ${i}/${n})…`);
+        await tick0();
+        const cv = await S.renderPage(doc, i);
+        res.cands.push(...S.analyzePage(cv, i));
+        // tiene solo una miniatura (risparmio memoria sul tablet)
+        const t = document.createElement('canvas');
+        t.width = 700; t.height = Math.round(cv.height * 700 / cv.width);
+        t.getContext('2d').drawImage(cv, 0, 0, t.width, t.height);
+        canvases.push({ t, k: 700 / cv.width });
+        cv.width = cv.height = 0;
+      }
+      try { doc.destroy(); } catch (e) { /* ignore */ }
+      const v = S.matchViews(res.cands, info.W, info.D, info.H);
+      res.views = { front: v.front, side: v.side, top: v.top };
+      if (v.front) {
+        res.profile = S.frontProfile(v.front, info.W, info.H);
+        res.bridge = S.bridgeFromFront(v.front, info.W, info.H);
+      }
+      // miniature con le viste evidenziate
+      const role = c => (c === v.front ? 'fronte' : c === v.side ? 'fianco' : c === v.top ? 'pianta' : '');
+      const col = { fronte: '#e53935', fianco: '#1e88e5', pianta: '#fb8c00' };
+      canvases.forEach(({ t, k }, i) => {
+        const x = t.getContext('2d');
+        res.cands.filter(c => c.page === i + 1 && role(c)).forEach(c => {
+          const r = role(c);
+          x.strokeStyle = col[r]; x.lineWidth = 4;
+          x.strokeRect(c.x * k, c.y * k, c.w * k, c.h * k);
+          x.fillStyle = col[r]; x.font = 'bold 22px sans-serif';
+          x.fillText(r.toUpperCase(), c.x * k + 4, Math.max(22, c.y * k - 6));
+        });
+        res.thumbs.push(t.toDataURL('image/jpeg', 0.75));
+      });
+      res.status = 'ok';
+      log('scheda', { url: res.url, pagine: n, viste: Object.keys(res.views).filter(k => res.views[k]), profilo: res.profile, ponte: res.bridge });
+    } catch (e) {
+      res.status = /HTTP 404/.test(String(e)) ? 'none' : 'error';
+      res.error = String(e && e.message || e);
+      log('scheda tecnica', res.error);
+    }
+    sheetCache[key] = res;
+    return res;
+  }
+
+  function renderSheetBox(sheet) {
+    const s = state;
+    const box = el('div', { class: 'sheet' });
+    let txt;
+    if (!sheet || sheet.status === 'none') txt = 'Scheda tecnica non disponibile per questo prodotto: misure di forma stimate.';
+    else if (sheet.status === 'error') txt = 'Scheda tecnica non leggibile (' + sheet.error + '): misure di forma stimate.';
+    else {
+      const f = k => (sheet.views[k] ? '✓' : '✗');
+      txt = `Scheda tecnica letta – viste riconosciute: fronte ${f('front')} · fianco ${f('side')} · pianta ${f('top')}`;
+      if (!sheet.views.front && !sheet.views.side && !sheet.views.top) txt += ' (solo prospettive o istruzioni: misure stimate, verificale sul disegno).';
+    }
+    box.appendChild(el('div', { text: txt }));
+    if (sheet && sheet.thumbs && sheet.thumbs.length) {
+      const strip = el('div', { class: 'thumbs' });
+      sheet.thumbs.forEach((src, i) => {
+        const im = el('img', { src, alt: 'Pagina ' + (i + 1) });
+        im.addEventListener('click', () => im.classList.toggle('big'));
+        strip.appendChild(im);
+      });
+      box.appendChild(strip);
+      box.appendChild(el('div', { class: 'hint', text: 'Tocca una pagina per ingrandirla (riquadri colorati = viste usate).' }));
+    }
+    if (sheet && sheet.url && sheet.status === 'ok') box.appendChild(el('a', { href: sheet.url, target: '_blank', rel: 'noopener', text: 'Apri il PDF originale' }));
+    s.bd.appendChild(box);
+  }
+
+  // --- parametri di forma: modulo generico
+  function paramKey() { return 'param:' + (state && state.info.code); }
+  function loadParams() {
+    try {
+      if (typeof GM_getValue !== 'function') return null;
+      return GM_getValue(paramKey(), null) || GM_getValue('ponte:' + (state && state.info.code), null);
+    } catch (e) { return null; }
+  }
+  function saveParams(v) {
+    try { if (typeof GM_setValue === 'function') GM_setValue(paramKey(), v); } catch (e) { log('salvataggio parametri', String(e)); }
+  }
+
+  function renderParamsForm(spec) {
+    const s = state;
+    const list = spec.params;
+    const anyEst = list.some(p => p.src === 'stima');
+    const box = el('div', { class: anyEst ? 'warn' : 'note ok' });
+    box.appendChild(el('div', { text: anyEst
+      ? 'Misure di forma (cm). Quelle "stimata" vanno verificate sul disegno della scheda tecnica:'
+      : 'Misure di forma (cm), tutte ricavate dalla scheda tecnica o inserite da te:' }));
     const inputs = {};
     const grid = el('div', { class: 'fg' });
-    fields.forEach(([k, lab]) => {
-      const inp = el('input', { type: 'number', inputmode: 'decimal', step: '0.5', min: '0', value: String(Math.round(bp[k] * 10) / 10) });
-      inputs[k] = inp;
-      grid.appendChild(el('label', null, [el('span', { text: lab }), inp]));
+    const tag = { scheda: 'dalla scheda', stima: 'stimata', utente: 'inserita da te' };
+    list.forEach(p => {
+      const inp = el('input', { type: 'number', inputmode: 'decimal', step: '0.5', min: '0', value: String(p.v) });
+      inputs[p.k] = inp;
+      grid.appendChild(el('label', null, [el('span', null, [p.label + ' ', el('i', { class: 'src ' + p.src, text: tag[p.src] })]), inp]));
     });
     box.appendChild(grid);
     const apply = el('button', { class: 'btn pri', text: 'Applica e salva' });
     apply.addEventListener('click', () => {
       const v = {};
-      for (const k in inputs) v[k] = toNum(inputs[k].value);
-      saveBridge(v); s.bridge = v; rebuild();
+      list.forEach(p => { const n = toNum(inputs[p.k].value); if (isFinite(n) && Math.abs(n - p.v) > 0.05) v[p.k] = n; else if (p.src === 'utente') v[p.k] = p.v; });
+      saveParams(Object.keys(v).length ? v : null); s.saved = Object.keys(v).length ? v : null; rebuild();
     });
-    const reset = el('button', { class: 'btn', text: 'Ripristina stime' });
-    reset.addEventListener('click', () => { saveBridge(null); s.bridge = null; rebuild(); });
+    const reset = el('button', { class: 'btn', text: 'Ripristina' });
+    reset.addEventListener('click', () => { saveParams(null); try { GM_setValue('ponte:' + s.info.code, null); } catch (e) { /* ignore */ } s.saved = null; rebuild(); });
     box.appendChild(el('div', { class: 'row' }, [apply, reset]));
     s.bd.appendChild(box);
   }
@@ -1216,9 +2008,17 @@
       'Immagine: ' + (s && s.info.imageUrl),
     ];
     if (res) {
-      const sp = Object.assign({}, res.spec);
+      const sp = Object.assign({}, res.spec); delete sp.params;
       lines.push('Spec: ' + JSON.stringify(sp));
       lines.push('Colori: ' + JSON.stringify(res.finishes.map(f => ({ n: f.name, k: f.key, c: f.c }))));
+    }
+    if (s && s.sheet) {
+      const sh = s.sheet;
+      lines.push('--- scheda tecnica ---', 'URL: ' + sh.url, 'Stato: ' + sh.status + (sh.error ? ' (' + sh.error + ')' : ''));
+      const role = c => (c === sh.views.front ? 'FRONTE' : c === sh.views.side ? 'FIANCO' : c === sh.views.top ? 'PIANTA' : '');
+      (sh.cands || []).forEach(c => lines.push(`p${c.page} ${c.w}x${c.h} rapp ${(c.w / c.h).toFixed(3)} rett ${c.rect.toFixed(2)} dens ${c.density.toFixed(2)} ${c.usable ? 'utile' : 'scartata'} ${role(c)}`));
+      if (sh.profile) lines.push('Profilo fronte: ' + JSON.stringify(sh.profile));
+      if (sh.bridge) lines.push('Ponte dal fronte: ' + JSON.stringify(sh.bridge));
     }
     lines.push('--- misure trovate in pagina ---', ...pageMeasures());
     lines.push('--- log ---', ...LOG);
@@ -1293,7 +2093,7 @@
     root.traverse(o => { if (o.isMesh && o.material && o.material.isMeshStandardMaterial) o.material.envMapIntensity = o.material.metalness > 0.5 ? 1 : 0.35; });
     scene.add(root);
     const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 100);
-    camera.position.set(maxD * 1.0, size.y * 0.7 + maxD * 0.4, maxD * 2.3);
+    camera.position.set(maxD * 1.1, size.y * 0.7 + maxD * 0.45, maxD * 2.5);
     const controls = new THREE.OrbitControls(camera, renderer.domElement);
     controls.target.set(0, size.y / 2, 0);
     controls.enableDamping = true;
