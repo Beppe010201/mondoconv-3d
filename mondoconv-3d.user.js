@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mondo Convenienza → modello 3D (GLB)
 // @namespace    https://github.com/mondoconv-3d
-// @version      0.2.0
+// @version      0.3.0
 // @description  Aggiunge un pulsante alle pagine prodotto di mondoconv.it che genera un modello 3D parametrico (.glb) a partire da misure, struttura e colori della scheda prodotto.
 // @match        https://www.mondoconv.it/*
 // @match        https://mondoconv.it/*
@@ -11,6 +11,8 @@
 // @require      https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/environments/RoomEnvironment.js#sha256=251b4e779abb5b432f99a326878fe239747c1fe55f390933085fc3deb20d2cea
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      media.mondoconv.it
 // @inject-into  content
 // @run-at       document-idle
@@ -32,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.3.0';
   const PRODUCT_PATH_RE = /^\/[a-z0-9-]+-([a-z0-9]{4})\.html$/i;
   const LOG = [];
   const log = (...a) => {
@@ -267,7 +269,17 @@
       spec.invalid = true;
     }
     if (spec.category === 'cabina' || /ANGOLAR/.test(head)) spec.notes.push('Forma angolare semplificata: generato come mobile rettangolare con le stesse misure di ingombro.');
-    if (/\bPONTE\b/.test(head)) spec.notes.push('Armadio a ponte semplificato: generato come blocco unico (il vano sopra il letto non è modellato).');
+    if (/\bPONTE\b/.test(head) && spec.family === 'cabinet') {
+      spec.bridge = true;
+      // composizione ante: "(1+4+1)"; se assente si stima 1 anta per colonna
+      const comp = head.match(/\(\s*(\d+)\s*\+\s*(\d+)\s*\+\s*(\d+)\s*\)/);
+      if (comp) spec.bridgeDoors = [+comp[1], +comp[2], +comp[3]];
+      else {
+        const n = spec.doors || 6;
+        spec.bridgeDoors = n >= 3 ? [1, n - 2, 1] : [1, Math.max(1, n - 1), 0];
+        spec.notes.push(`Composizione ante non indicata: stimata ${spec.bridgeDoors.join('+')}.`);
+      }
+    }
     if (spec.openSection) spec.notes.push('Vano a giorno: posizione stimata (colonna a destra).');
     return spec;
   }
@@ -783,7 +795,7 @@
       const len = Math.min(h > 1.4 ? 0.3 : 0.16, h * 0.4);
       const x = f.hinge === 'L' ? f.x1 - 0.045 : f.x0 + 0.045;
       // altezza maniglia: ~105 cm da terra per ante alte, centro anta altrimenti
-      let y = h > 1.4 ? 1.05 : (f.y0 + f.y1) / 2;
+      let y = h > 1.4 ? 1.05 : spec.category === 'pensile' ? f.y0 + len / 2 + 0.04 : (f.y0 + f.y1) / 2;
       y = Math.min(f.y1 - len / 2 - 0.03, Math.max(f.y0 + len / 2 + 0.03, y));
       box(g, name, s, len, s, x, y, zFace + off, mat);
       box(g, name + '_a', s, s, off, x, y - len / 2 + s, zFace + off / 2, mat);
@@ -866,6 +878,48 @@
     return g;
   }
 
+  /** Parametri del ponte: valori salvati dall'utente per questo prodotto, altrimenti stime. */
+  const BRIDGE_DEFAULTS = { colW: 47, bridgeH: 62 }; // cm: modulo colonna 1 anta tipico MC; altezza pensile stimata
+
+  function bridgeParams(spec, saved) {
+    const W = spec.W * 100, D = spec.D * 100, H = spec.H * 100;
+    const [nl, , nr] = spec.bridgeDoors;
+    const colDef = Math.min(BRIDGE_DEFAULTS.colW, W / 4);
+    const p = {
+      colL: nl ? colDef * nl : 0,
+      colR: nr ? colDef * nr : 0,
+      bridgeH: Math.min(BRIDGE_DEFAULTS.bridgeH, H * 0.4),
+      bridgeD: D,
+      estimated: true,
+    };
+    if (saved) {
+      for (const k of ['colL', 'colR', 'bridgeH', 'bridgeD']) if (saved[k] > 0) p[k] = saved[k];
+      p.estimated = false;
+    }
+    return p;
+  }
+
+  /** Armadio a ponte: colonne a terra + pensile sopra il vano letto (misure in cm nei parametri). */
+  function buildBridge(spec, mats, bp) {
+    const g = new THREE.Group();
+    const W = spec.W, D = spec.D, H = spec.H;
+    const colL = bp.colL / 100, colR = bp.colR / 100, bH = bp.bridgeH / 100, bD = Math.min(bp.bridgeD / 100, D);
+    const midW = W - colL - colR;
+    if (midW < 0.3) throw new Error('Parametri ponte non validi: il vano centrale risulta ' + Math.round(midW * 100) + ' cm');
+    const [nl, nm, nr] = spec.bridgeDoors;
+    const sub = (w, d, h, doors, cat) => Object.assign({}, spec, {
+      W: w, D: d, H: h, doors, drawers: 0, category: cat, bridge: false, notes: [],
+      shelvesTotal: null, rods: null, mirror: 'none', openSection: false, flap: false, sliding: false, longDoors: false,
+    });
+    const place = (obj, name, x, y, z) => { obj.name = name; obj.position.set(x, y, z); g.add(obj); };
+    if (colL > 0) place(buildCabinet(sub(colL, D, H, nl, 'armadio'), mats), 'Colonna_SX', -W / 2 + colL / 2, 0, 0);
+    if (colR > 0) place(buildCabinet(sub(colR, D, H, nr, 'armadio'), mats), 'Colonna_DX', W / 2 - colR / 2, 0, 0);
+    // pensile: appoggiato alla parete (schiena a -D/2), sotto il cielo delle colonne
+    place(buildCabinet(sub(midW, bD, bH, nm, 'pensile'), mats), 'Ponte', -W / 2 + colL + midW / 2, H - bH, -D / 2 + bD / 2);
+    spec.bridgeInfo = { vanoW: Math.round(midW * 100), luce: Math.round((H - bH) * 100) };
+    return g;
+  }
+
   /** Segnaposto per categorie non ancora gestite: volume d'ingombro con misure e colore reali. */
   function buildPlaceholder(spec, mats) {
     const g = new THREE.Group();
@@ -881,6 +935,7 @@
     const mats = buildMaterials(spec, finishes, opts);
     let group, supported = true;
     if (spec.family === 'table') group = buildTable(spec, mats, !!opts.open);
+    else if (spec.bridge) { spec.bp = bridgeParams(spec, opts.bridge); group = buildBridge(spec, mats, spec.bp); }
     else if (spec.category) group = buildCabinet(spec, mats);
     else {
       supported = false;
@@ -952,6 +1007,10 @@
     .btn { border: 1px solid #c8c8c8; background: #fafafa; border-radius: 8px; padding: 10px 14px; font-size: 14px; cursor: pointer; color: #222; }
     .btn.pri { background: #1f5fbf; border-color: #1f5fbf; color: #fff; font-weight: 600; }
     .btn:disabled { opacity: .5; }
+    .fg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0; }
+    .fg label { display: flex; flex-direction: column; font-size: 12px; color: #555; gap: 3px; }
+    .fg input { font-size: 16px; padding: 7px 8px; border: 1px solid #bbb; border-radius: 6px; width: 100%; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
     details { margin-top: 8px; }
     pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; background: #f6f6f6; padding: 8px; border-radius: 6px; max-height: 200px; overflow: auto; }
   `;
@@ -1009,6 +1068,7 @@
     ov.addEventListener('click', e => { if (e.target === ov) closePanel(); });
     shadow.appendChild(ov);
     state = { ov, vw, msg, bd, ft, info, swap: false };
+    state.bridge = loadBridge();
 
     if (!info.source) {
       msg.textContent = 'Non trovo le misure del prodotto in questa pagina. Attendi il caricamento completo (o apri la sezione "Scheda tecnica") e riprova.';
@@ -1025,7 +1085,7 @@
     s.msg.textContent = 'Generazione in corso…';
     let res;
     try {
-      res = await buildModel(s.info, { swap: s.swap, open: s.open });
+      res = await buildModel(s.info, { swap: s.swap, open: s.open, bridge: s.bridge });
     } catch (e) {
       log('errore build', String(e && e.stack || e));
       s.msg.textContent = 'Errore nella generazione: ' + (e && e.message || e);
@@ -1067,7 +1127,13 @@
     add(isTable ? 'Piano' : 'Struttura', sw(bodyF));
     const hasFrontPieces = spec.doors > 0 || spec.drawers > 0 || spec.flap;
     if (isTable ? true : (finishes.length > 1 || hasFrontPieces)) add(isTable ? 'Gambe' : 'Colore frontali', sw(frontF));
+    if (spec.bridge && spec.bp) {
+      const bp = spec.bp;
+      add('Composizione', `colonna SX ${spec.bridgeDoors[0]} anta · ponte ${spec.bridgeDoors[1]} ante · colonna DX ${spec.bridgeDoors[2]} anta`);
+      add('Vano letto', `larghezza ${spec.bridgeInfo.vanoW} cm · luce sotto il ponte ${spec.bridgeInfo.luce} cm`);
+    }
     s.bd.appendChild(el('table', null, rows));
+    if (spec.bridge && spec.bp) renderBridgeForm(spec);
     s.info.warnings.forEach(w => s.bd.appendChild(el('div', { class: 'warn', text: w })));
     spec.notes.forEach(n => s.bd.appendChild(el('div', { class: 'note', text: '• ' + n })));
 
@@ -1099,6 +1165,41 @@
     s.ft.appendChild(el('button', { class: 'btn', text: 'Chiudi', onclick: closePanel }));
   }
 
+  function bridgeKey() { return 'ponte:' + (state && state.info.code); }
+  function loadBridge() {
+    try { return typeof GM_getValue === 'function' ? GM_getValue(bridgeKey(), null) : null; } catch (e) { return null; }
+  }
+  function saveBridge(v) {
+    try { if (typeof GM_setValue === 'function') GM_setValue(bridgeKey(), v); } catch (e) { log('salvataggio parametri', String(e)); }
+  }
+
+  function renderBridgeForm(spec) {
+    const s = state, bp = spec.bp;
+    const box = el('div', { class: bp.estimated ? 'warn' : 'note' });
+    box.appendChild(el('div', { text: bp.estimated
+      ? 'Misure dei componenti STIMATE. Controlla il disegno nella scheda tecnica del prodotto e correggi qui (cm):'
+      : 'Misure dei componenti inserite da te (salvate per questo prodotto). Puoi modificarle (cm):' }));
+    const fields = [['colL', 'Largh. colonna SX'], ['colR', 'Largh. colonna DX'], ['bridgeH', 'Altezza ponte'], ['bridgeD', 'Profondità ponte']];
+    const inputs = {};
+    const grid = el('div', { class: 'fg' });
+    fields.forEach(([k, lab]) => {
+      const inp = el('input', { type: 'number', inputmode: 'decimal', step: '0.5', min: '0', value: String(Math.round(bp[k] * 10) / 10) });
+      inputs[k] = inp;
+      grid.appendChild(el('label', null, [el('span', { text: lab }), inp]));
+    });
+    box.appendChild(grid);
+    const apply = el('button', { class: 'btn pri', text: 'Applica e salva' });
+    apply.addEventListener('click', () => {
+      const v = {};
+      for (const k in inputs) v[k] = toNum(inputs[k].value);
+      saveBridge(v); s.bridge = v; rebuild();
+    });
+    const reset = el('button', { class: 'btn', text: 'Ripristina stime' });
+    reset.addEventListener('click', () => { saveBridge(null); s.bridge = null; rebuild(); });
+    box.appendChild(el('div', { class: 'row' }, [apply, reset]));
+    s.bd.appendChild(box);
+  }
+
   function alertBox(text) {
     if (state) state.bd.prepend(el('div', { class: 'warn', text }));
   }
@@ -1119,8 +1220,21 @@
       lines.push('Spec: ' + JSON.stringify(sp));
       lines.push('Colori: ' + JSON.stringify(res.finishes.map(f => ({ n: f.name, k: f.key, c: f.c }))));
     }
+    lines.push('--- misure trovate in pagina ---', ...pageMeasures());
     lines.push('--- log ---', ...LOG);
     return lines.join('\n');
+  }
+
+  /** Elenca le occorrenze di misure nel testo pagina con un po' di contesto (escluse le varianti "Altre..."). */
+  function pageMeasures() {
+    const t = (state && state.info.bodyText) || '';
+    const re = /(\d{2,3}(?:[.,]\d)?)\s*[x×]\s*(\d{2,3}(?:[.,]\d)?)\s*[x×]\s*(\d{2,3}(?:[.,]\d)?)|L\.?\s*\d{2,3}\s*P\.?\s*\d{2,3}\s*H\.?\s*\d{2,3}|(?:larghezza|altezza|profondit[aà])[^0-9]{0,20}\d{2,3}/gi;
+    const out = [];
+    let m;
+    while ((m = re.exec(t)) && out.length < 40) {
+      out.push('…' + t.slice(Math.max(0, m.index - 70), m.index + m[0].length + 30).trim() + '…');
+    }
+    return out.length ? out : ['(nessuna)'];
   }
 
   function renderDiagnostics(res) {
