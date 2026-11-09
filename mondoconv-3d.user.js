@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mondo Convenienza → modello 3D (GLB)
 // @namespace    https://github.com/mondoconv-3d
-// @version      0.1.0
+// @version      0.2.0
 // @description  Aggiunge un pulsante alle pagine prodotto di mondoconv.it che genera un modello 3D parametrico (.glb) a partire da misure, struttura e colori della scheda prodotto.
 // @match        https://www.mondoconv.it/*
 // @match        https://mondoconv.it/*
@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.0';
   const PRODUCT_PATH_RE = /^\/[a-z0-9-]+-([a-z0-9]{4})\.html$/i;
   const LOG = [];
   const log = (...a) => {
@@ -171,6 +171,14 @@
     ['mobile', /\bMOBILE\b|\bMOBILETTO\b/],
   ];
 
+  // Tipi gestiti dal generatore "tavolo" (piano + gambe)
+  const TABLE_TYPES = [
+    ['tavolino', /\bTAVOLIN|\bTAVOLO DA SALOTTO\b|\bCOFFEE\b/],
+    ['scrivania', /\bSCRIVANI/],
+    ['consolle', /\bCONSOLL/],
+    ['tavolo', /\bTAVOL[OI]\b/],
+  ];
+
   function interpret(info) {
     const head = (info.head || '').toUpperCase();
     const spec = {
@@ -178,10 +186,11 @@
       notes: [], category: null, collection: null, label: '',
     };
 
-    for (const [cat, re] of CABINET_TYPES) {
+    for (const [cat, re] of TABLE_TYPES.concat(CABINET_TYPES)) {
       const m = head.match(re);
       if (m) {
         spec.category = cat;
+        spec.family = TABLE_TYPES.some(x => x[0] === cat) ? 'table' : 'cabinet';
         spec.collection = head.slice(0, m.index).trim() || null;
         spec.label = head.slice(m.index).trim();
         break;
@@ -222,7 +231,7 @@
     spec.feet = /piedin/i.test(body) && !/senza piedini/i.test(body);
     const han = body.match(/manigli[ae][^.]{0,80}?(nel colore dell['’ ]anta|cromo|cromat|alluminio|acciaio|nero|nera|oro|ottone|bronzo|legno|bianc)/i);
     spec.handleHint = han ? han[1].toLowerCase() : null;
-    spec.pushOpen = /apertura a pressione|push[- ]?pull|tip[- ]?on|senza maniglie|gola/i.test(body);
+    spec.pushOpen = /apertura a pressione|push[- ]?pull|tip[- ]?on|senza maniglie|maniglia a gola|apertura a gola|con gola\b/i.test(body);
 
     // --- colori: "COLORE OLMO", "COLORE TITANIO / BIANCO LUCIDO"
     let colorStr = '';
@@ -238,6 +247,20 @@
       colorStr = t;
     }
     spec.colorNames = colorStr.split(/\s*[\/,]\s*/).map(s => s.trim()).filter(Boolean);
+
+    // --- tavoli: allungabile, forma, vetro
+    if (spec.family === 'table') {
+      spec.extendable = /RADDOPPIABIL|ALLUNGABIL|ESTENSIBIL|ALLUNGA\b|\bA LIBRO\b/.test(head);
+      const mx = head.match(/MAX\.?\s*(\d+(?:[.,]\d+)?)\s*CM/);
+      spec.maxW = mx ? toNum(mx[1]) / 100 : null;
+      if (spec.extendable && !spec.maxW && /RADDOPPIABIL/.test(head)) spec.maxW = spec.W * 2;
+      spec.round = /ROTOND|\bTOND|CIRCOLAR|OVAL/.test(head);
+      spec.oval = /OVAL/.test(head);
+      spec.glassTop = /VETRO/.test(head) || spec.colorNames.some(n => /vetro|cristallo/i.test(n));
+      spec.lowerShelf = /RIPIANO|CONTENITORE|PORTARIVISTE/.test(head);
+      spec.pedestal = /BASAMENTO|CENTRALE|COLONNA/.test(head);
+      if (spec.extendable && !spec.maxW) spec.notes.push('Tavolo allungabile: misura da aperto non indicata, generato solo chiuso.');
+    }
 
     // --- coerenza misure
     if (!(spec.W > 0.05 && spec.D > 0.05 && spec.H > 0.05) || spec.W > 8 || spec.D > 8 || spec.H > 4) {
@@ -487,9 +510,10 @@
     const a = finishes[0];
     const b = finishes[1] || finishes[0];
     const [body, front] = opts.swap ? [b, a] : [a, b];
+    const roles = spec.family === 'table' ? ['Piano_', 'Gambe_'] : ['Struttura_', 'Frontali_'];
     const mats = {
-      body: makeMaterial(body, 'Struttura_' + body.name, opts),
-      front: makeMaterial(front, 'Frontali_' + front.name, opts),
+      body: makeMaterial(body, roles[0] + body.name, opts),
+      front: makeMaterial(front, roles[1] + front.name, opts),
       back: new THREE.MeshStandardMaterial({ name: 'Schienale', color: lin(body.kind === 'wood' ? body.c : '#d8d4cc'), roughness: 0.8 }),
       mirror: new THREE.MeshStandardMaterial({ name: 'Specchio', color: lin(0xe8eef2), roughness: 0.04, metalness: 1 }),
       glass: new THREE.MeshStandardMaterial({ name: 'Vetro', color: lin(0xdfeceb), roughness: 0.05, metalness: 0, transparent: true, opacity: 0.3 }),
@@ -767,6 +791,81 @@
     }
   }
 
+  /**
+   * Generatore "tavolo": tavoli da pranzo, tavolini, scrivanie, consolle.
+   * Colori: il primo nome è il piano, il secondo le gambe/struttura (invertibili dal pannello).
+   */
+  function buildTable(spec, mats, open) {
+    const g = new THREE.Group();
+    const W = open && spec.maxW ? spec.maxW : spec.W;
+    const D = spec.D, H = spec.H;
+    const coffee = spec.category === 'tavolino' || H < 0.6;
+    const topT = spec.glassTop ? 0.012 : (spec.extendable && !open && /RADDOPPIABIL|A LIBRO/.test(spec.label) ? 0.05 : 0.03);
+    const topMat = spec.glassTop ? mats.glass : mats.body;
+    const legMat = spec.glassTop && mats.body === mats.front ? mats.handle : mats.front;
+    const yTop = H - topT / 2;
+
+    // piano
+    if (spec.round && !open) {
+      const top = new THREE.Mesh(new THREE.CylinderGeometry(W / 2, W / 2, topT, 64), topMat);
+      top.name = 'Piano';
+      top.scale.z = D / W;
+      top.position.y = yTop;
+      g.add(top);
+    } else {
+      box(g, 'Piano', W, topT, D, 0, yTop, 0, topMat);
+      if (spec.extendable && !open && /RADDOPPIABIL|A LIBRO/.test(spec.label)) {
+        // piano a libro chiuso: due ante sovrapposte, linea di separazione
+        box(g, 'Piano_linea', W + 0.001, 0.002, D + 0.001, 0, yTop, 0, mats.back);
+      }
+    }
+
+    const legH = H - topT;
+    if (spec.round && !open) {
+      // tavolo tondo: colonna centrale + base
+      const r = coffee ? 0.04 : 0.05;
+      cyl(g, 'Colonna', r, legH - 0.02, 0, (legH - 0.02) / 2 + 0.02, 0, legMat);
+      const baseR = Math.min(W, D) * (coffee ? 0.32 : 0.28);
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(baseR, baseR, 0.02, 48), legMat);
+      base.name = 'Base';
+      base.position.y = 0.01;
+      g.add(base);
+    } else if (spec.pedestal) {
+      // basamento centrale rettangolare
+      box(g, 'Basamento', Math.min(0.5, W * 0.4), legH, Math.min(0.4, D * 0.4), 0, legH / 2, 0, legMat);
+      box(g, 'Base', W * 0.6, 0.02, D * 0.5, 0, 0.01, 0, legMat);
+    } else {
+      // 4 gambe quadrate + fascia sottopiano
+      const ls = coffee ? 0.045 : spec.category === 'consolle' ? 0.04 : 0.06;
+      const inset = 0.03;
+      const lx = W / 2 - inset - ls / 2, lz = D / 2 - inset - ls / 2;
+      [[-lx, -lz], [lx, -lz], [-lx, lz], [lx, lz]].forEach(([x, z], i) =>
+        box(g, 'Gamba_' + (i + 1), ls, legH, ls, x, legH / 2, z, legMat));
+      if (!spec.glassTop) {
+        const fh = coffee ? 0.05 : 0.08, ft = 0.02;
+        const fy = legH - fh / 2;
+        box(g, 'Fascia_fronte', 2 * lx - ls, fh, ft, 0, fy, lz + ls / 2 - ft / 2, legMat);
+        box(g, 'Fascia_retro', 2 * lx - ls, fh, ft, 0, fy, -lz - ls / 2 + ft / 2, legMat);
+        box(g, 'Fascia_SX', ft, fh, 2 * lz - ls, -lx - ls / 2 + ft / 2, fy, 0, legMat);
+        box(g, 'Fascia_DX', ft, fh, 2 * lz - ls, lx + ls / 2 - ft / 2, fy, 0, legMat);
+      }
+      if (coffee && spec.lowerShelf) box(g, 'Ripiano_inferiore', 2 * lx - ls, 0.02, 2 * lz - ls, 0, 0.12, 0, mats.body);
+      if (spec.category === 'scrivania' && spec.drawers > 0) {
+        // cassettiera sospesa a destra sotto il piano
+        const cw = Math.min(0.42, W * 0.35), ch = Math.min(0.15 * spec.drawers, legH * 0.5);
+        const cx = lx - ls / 2 - cw / 2 - 0.005;
+        box(g, 'Cassettiera', cw, ch, D - 2 * inset - ls, cx, legH - ch / 2, 0, mats.body);
+        for (let k = 0; k < spec.drawers; k++) {
+          const y = legH - (ch / spec.drawers) * (k + 0.5);
+          box(g, 'Maniglia_cassetto_' + (k + 1), Math.min(0.15, cw * 0.4), 0.012, 0.012, cx, y, D / 2 - inset - ls / 2 + 0.02, mats.handle);
+        }
+      }
+    }
+    if (open && spec.maxW) spec.notes.push(`Versione aperta: piano allungato a ${Math.round(spec.maxW * 100)} cm.`);
+    if (spec.round && open) spec.notes.push('Tavolo tondo aperto: rappresentato con piano rettangolare arrotondato semplificato.');
+    return g;
+  }
+
   /** Segnaposto per categorie non ancora gestite: volume d'ingombro con misure e colore reali. */
   function buildPlaceholder(spec, mats) {
     const g = new THREE.Group();
@@ -781,14 +880,15 @@
     const finishes = await resolveFinishes(spec, info);
     const mats = buildMaterials(spec, finishes, opts);
     let group, supported = true;
-    if (spec.category) group = buildCabinet(spec, mats);
+    if (spec.family === 'table') group = buildTable(spec, mats, !!opts.open);
+    else if (spec.category) group = buildCabinet(spec, mats);
     else {
       supported = false;
       group = buildPlaceholder(spec, mats);
       spec.notes.unshift('Categoria non ancora supportata: generato un volume segnaposto con misure e colore corretti.');
     }
     const root = new THREE.Group();
-    root.name = fileBase(info, spec);
+    root.name = fileBase(info, spec) + (opts.open && spec.maxW ? '_aperto' : '');
     root.add(group);
     root.userData = { fonte: 'mondoconv.it', url: info.url, codice: info.code, misure_cm: [info.W, info.D, info.H], generatore: 'mondoconv-3d ' + VERSION };
     return { root, spec, finishes, supported };
@@ -925,7 +1025,7 @@
     s.msg.textContent = 'Generazione in corso…';
     let res;
     try {
-      res = await buildModel(s.info, { swap: s.swap });
+      res = await buildModel(s.info, { swap: s.swap, open: s.open });
     } catch (e) {
       log('errore build', String(e && e.stack || e));
       s.msg.textContent = 'Errore nella generazione: ' + (e && e.message || e);
@@ -946,8 +1046,14 @@
     const add = (k, v) => rows.push(el('tr', null, [el('td', { text: k }), typeof v === 'string' ? el('td', { text: v }) : el('td', null, [v])]));
     add('Prodotto', [spec.collection, spec.label].filter(Boolean).join(' – ').toLowerCase() || '—');
     add('Tipo', spec.category ? spec.category + (res.supported ? '' : '') : 'non supportato (segnaposto)');
-    add('Misure', `L ${s.info.W} × P ${s.info.D} × H ${s.info.H} cm`);
-    if (spec.category) {
+    add('Misure', `L ${s.open && spec.maxW ? Math.round(spec.maxW * 100) + ' (aperto)' : s.info.W} × P ${s.info.D} × H ${s.info.H} cm`);
+    if (spec.family === 'table') {
+      const d = [];
+      if (spec.extendable) d.push(spec.maxW ? `allungabile fino a ${Math.round(spec.maxW * 100)} cm` : 'allungabile');
+      if (spec.round) d.push('piano tondo');
+      if (spec.glassTop) d.push('piano in vetro');
+      if (d.length) add('Dettagli', d.join(', '));
+    } else if (spec.category) {
       const fr = [];
       if (spec.doors) fr.push(`${spec.doors} ${spec.doors === 1 ? 'anta' : 'ante'} ${spec.sliding ? 'scorrevoli' : spec.flap ? 'a ribalta' : 'battenti'}`);
       if (spec.drawers) fr.push(`${spec.drawers} cassett${spec.drawers === 1 ? 'o' : 'i'}${spec.longDoors ? ' (interni)' : ''}`);
@@ -957,9 +1063,10 @@
     const a = finishes[0], b = finishes[1] || finishes[0];
     const [bodyF, frontF] = s.swap ? [b, a] : [a, b];
     const sw = f => el('span', null, [el('span', { class: 'sw', style: `background:${f.c}` }), f.name + (f.unknown ? (f.sampled ? ' (da foto)' : ' (?)') : '')]);
-    add('Struttura', sw(bodyF));
+    const isTable = spec.family === 'table';
+    add(isTable ? 'Piano' : 'Struttura', sw(bodyF));
     const hasFrontPieces = spec.doors > 0 || spec.drawers > 0 || spec.flap;
-    if (finishes.length > 1 || hasFrontPieces) add('Colore frontali', sw(frontF));
+    if (isTable ? true : (finishes.length > 1 || hasFrontPieces)) add(isTable ? 'Gambe' : 'Colore frontali', sw(frontF));
     s.bd.appendChild(el('table', null, rows));
     s.info.warnings.forEach(w => s.bd.appendChild(el('div', { class: 'warn', text: w })));
     spec.notes.forEach(n => s.bd.appendChild(el('div', { class: 'note', text: '• ' + n })));
@@ -984,6 +1091,10 @@
     s.ft.appendChild(dl);
     if (finishes.length > 1) {
       s.ft.appendChild(el('button', { class: 'btn', text: 'Inverti colori', onclick: () => { s.swap = !s.swap; rebuild(); } }));
+    }
+    if (spec.family === 'table' && spec.maxW) {
+      const txt = s.open ? 'Mostra chiuso' : `Mostra aperto (${Math.round(spec.maxW * 100)} cm)`;
+      s.ft.appendChild(el('button', { class: 'btn', text: txt, onclick: () => { s.open = !s.open; rebuild(); } }));
     }
     s.ft.appendChild(el('button', { class: 'btn', text: 'Chiudi', onclick: closePanel }));
   }
