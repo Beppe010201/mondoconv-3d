@@ -1,7 +1,7 @@
 # mondoconv-3d — userscript modelli 3D Mondo Convenienza
 
-Utente: Giuseppe (italiano, ingegnere automazione, non programmatore web). Rispondere in italiano,
-procedere a passi con conferma, spiegare il perché, priorità a correttezza e sicurezza.
+Rispondere in italiano, procedere a passi con conferma, spiegare il perché,
+priorità a correttezza e sicurezza.
 
 ## Cosa fa
 Userscript (Tampermonkey su Chrome PC, Violentmonkey su Firefox Android) per www.mondoconv.it.
