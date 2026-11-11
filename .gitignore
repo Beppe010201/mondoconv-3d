@@ -1,0 +1,5 @@
+node_modules/
+__pycache__/
+*.glb
+# schede tecniche di Mondo Convenienza: materiale di terzi, non pubblicarle
+test/schede/
